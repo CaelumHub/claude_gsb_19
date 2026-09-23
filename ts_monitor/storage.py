@@ -40,7 +40,10 @@ class TimeSeriesStorage:
         # Load metadata and rules
         self.metadata = self._load_json(self.meta_file, {"sources": {}, "stats": {}})
         self.rules = self._load_json(self.rules_file, {"rules": []})
-        self.alerts = self._load_json(self.alerts_file, {"alerts": [], "suppressed": {}})
+        self.alerts = self._load_json(self.alerts_file, {"alerts": [], "notifications": []})
+        # Migrate older layouts
+        self.alerts.setdefault("alerts", [])
+        self.alerts.setdefault("notifications", [])
 
     def _load_json(self, path: str, default: Any) -> Any:
         """Load JSON file with fallback to default."""
@@ -325,27 +328,22 @@ class TimeSeriesStorage:
         return sorted(alerts, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
 
     def add_alert(self, alert: Dict) -> Dict:
-        """Add a new alert with deduplication."""
-        alert_id = alert.get("id", f"alert_{int(time.time()*1000)}")
+        """Add a new alert record.
+
+        Deduplication and escalation decisions live in EscalationManager;
+        this method only persists a fresh alert and seeds its history.
+        """
+        alert_id = alert.get("id", f"alert_{time.time_ns()}")
         alert["id"] = alert_id
         alert["timestamp"] = alert.get("timestamp", time.time())
         alert["status"] = alert.get("status", "active")
-
-        # Check for duplicate/suppressed alerts
-        suppressed = self.alerts.get("suppressed", {})
-        metric = alert.get("metric", "")
-        rule_id = alert.get("rule_id", "")
-        suppress_key = f"{metric}:{rule_id}"
-
-        # Suppress if same metric+rule had an alert in the last 5 minutes
-        if suppress_key in suppressed:
-            last_alert_time = suppressed[suppress_key]
-            if time.time() - last_alert_time < 300:  # 5 min suppression
-                alert["status"] = "suppressed"
-                return alert
-
-        suppressed[suppress_key] = time.time()
-        self.alerts["suppressed"] = suppressed
+        alert["trigger_count"] = alert.get("trigger_count", 1)
+        alert["first_triggered_at"] = alert.get("first_triggered_at", alert["timestamp"])
+        alert["last_triggered_at"] = alert.get("last_triggered_at", alert["timestamp"])
+        alert["original_severity"] = alert.get("original_severity", alert.get("severity", "warning"))
+        alert["escalation_level"] = alert.get("escalation_level", 0)
+        alert["escalation_history"] = alert.get("escalation_history", [])
+        alert["trigger_times"] = alert.get("trigger_times", [alert["timestamp"]])
 
         self.alerts["alerts"].append(alert)
         # Keep only last 1000 alerts
@@ -355,35 +353,135 @@ class TimeSeriesStorage:
         self._save_json(self.alerts_file, self.alerts)
         return alert
 
-    def acknowledge_alert(self, alert_id: str) -> bool:
-        """Acknowledge an alert."""
+    def find_open_alert(self, metric: str, rule_id: str,
+                        tags: Optional[Dict] = None) -> Optional[Dict]:
+        """Find the most recent unresolved (active/acknowledged) alert for a metric+rule."""
+        for alert in reversed(self.alerts.get("alerts", [])):
+            if alert.get("metric") == metric and \
+               alert.get("rule_id") == rule_id and \
+               alert.get("status") in ("active", "acknowledged"):
+                if tags is None or alert.get("tags") == tags:
+                    return alert
+        return None
+
+    def get_open_alerts(self) -> List[Dict]:
+        """Return all alerts that are not resolved."""
+        return [a for a in self.alerts.get("alerts", [])
+                if a.get("status") in ("active", "acknowledged")]
+
+    def get_alert(self, alert_id: str) -> Optional[Dict]:
+        """Get a single alert by id."""
         for alert in self.alerts.get("alerts", []):
             if alert.get("id") == alert_id:
-                alert["status"] = "acknowledged"
-                alert["acknowledged_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
+                return alert
+        return None
+
+    def record_alert_trigger(self, alert_id: str, timestamp: float,
+                             value: Optional[float] = None,
+                             score: Optional[float] = None) -> Optional[Dict]:
+        """Register another trigger of an ongoing alert (repeat occurrence)."""
+        alert = self.get_alert(alert_id)
+        if alert is None:
+            return None
+        alert["trigger_count"] = int(alert.get("trigger_count", 1)) + 1
+        alert["last_triggered_at"] = timestamp
+        times = alert.setdefault("trigger_times", [])
+        times.append(timestamp)
+        # Bound the per-alert trigger sample list
+        if len(times) > 100:
+            alert["trigger_times"] = times[-100:]
+        if value is not None:
+            alert["value"] = value
+        if score is not None:
+            alert["score"] = score
+        self._save_json(self.alerts_file, self.alerts)
+        return alert
+
+    def append_escalation_entry(self, alert_id: str, entry: Dict) -> Optional[Dict]:
+        """Append an entry to the alert's escalation history."""
+        alert = self.get_alert(alert_id)
+        if alert is None:
+            return None
+        entry.setdefault("timestamp", time.time())
+        alert.setdefault("escalation_history", []).append(entry)
+        self._save_json(self.alerts_file, self.alerts)
+        return entry
+
+    def escalate_alert(self, alert_id: str, new_severity: str,
+                       reason: str, timestamp: float,
+                       detail: Optional[str] = None) -> Optional[Dict]:
+        """Raise an alert's severity and record the escalation event.
+
+        No-op (returns None) when the alert already sits at that severity
+        level or higher.
+        """
+        alert = self.get_alert(alert_id)
+        if alert is None:
+            return None
+        order = {"info": 0, "warning": 1, "critical": 2}
+        if order.get(new_severity, 1) <= order.get(alert.get("severity"), 1):
+            return None
+        entry = {
+            "type": "escalated",
+            "reason": reason,
+            "detail": detail,
+            "from_severity": alert.get("severity"),
+            "to_severity": new_severity,
+            "timestamp": timestamp,
+        }
+        alert["severity"] = new_severity
+        alert["escalation_level"] = int(alert.get("escalation_level", 0)) + 1
+        alert.setdefault("escalation_history", []).append(entry)
+        self._save_json(self.alerts_file, self.alerts)
+        return entry
+
+    # ---- Notifications ----
+
+    def add_notification(self, notification: Dict) -> Dict:
+        """Persist an escalation notification."""
+        notification["id"] = notification.get("id", f"ntf_{time.time_ns()}")
+        notification["timestamp"] = notification.get("timestamp", time.time())
+        self.alerts.setdefault("notifications", []).append(notification)
+        # Keep only last 500 notifications
+        if len(self.alerts["notifications"]) > 500:
+            self.alerts["notifications"] = self.alerts["notifications"][-500:]
+        self._save_json(self.alerts_file, self.alerts)
+        return notification
+
+    def get_notifications(self, limit: int = 100) -> List[Dict]:
+        """Get recent escalation notifications, newest first."""
+        notes = self.alerts.get("notifications", [])
+        return sorted(notes, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+
+    def acknowledge_alert(self, alert_id: str) -> bool:
+        """Acknowledge an alert (handled — stops timeout escalation)."""
+        alert = self.get_alert(alert_id)
+        if alert is not None:
+            now = time.time()
+            alert["status"] = "acknowledged"
+            alert["acknowledged_at"] = now
+            alert.setdefault("escalation_history", []).append({
+                "type": "acknowledged",
+                "timestamp": now,
+            })
+            self._save_json(self.alerts_file, self.alerts)
+            return True
         return False
 
     def resolve_alert(self, alert_id: str) -> bool:
         """Resolve an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "resolved"
-                alert["resolved_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
+        alert = self.get_alert(alert_id)
+        if alert is not None:
+            now = time.time()
+            alert["status"] = "resolved"
+            alert["resolved_at"] = now
+            alert.setdefault("escalation_history", []).append({
+                "type": "resolved",
+                "timestamp": now,
+            })
+            self._save_json(self.alerts_file, self.alerts)
+            return True
         return False
-
-    def cleanup_suppressed(self):
-        """Clean up old suppression entries."""
-        suppressed = self.alerts.get("suppressed", {})
-        now = time.time()
-        self.alerts["suppressed"] = {
-            k: v for k, v in suppressed.items()
-            if now - v < 600  # Keep 10 minutes of suppression history
-        }
-        self._save_json(self.alerts_file, self.alerts)
 
     def get_stats(self) -> Dict:
         """Get storage statistics."""

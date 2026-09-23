@@ -19,6 +19,7 @@ from typing import Dict, Any, Optional
 from storage import TimeSeriesStorage
 from anomaly import AnomalyDetector
 from downsample import downsample_simple
+from escalation import EscalationManager
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -27,11 +28,49 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
 
 
+def process_point(storage: TimeSeriesStorage, detector: AnomalyDetector,
+                  escalator: EscalationManager, metric: str, value: float,
+                  timestamp: float, source: str,
+                  tags: Optional[Dict] = None) -> list:
+    """Run all enabled rules for one data point and route anomalies through
+    the escalation manager.
+
+    Returns the list of alert records produced (new alerts, repeated alerts
+    or escalated alerts).
+    """
+    results = []
+    for rule in storage.get_rules():
+        if rule.get("metric") != metric or not rule.get("enabled", True):
+            continue
+        is_anomaly, result = detector.detect(metric, float(value), rule)
+        if not is_anomaly:
+            continue
+        alert = {
+            "metric": metric,
+            "value": float(value),
+            "rule_id": rule.get("id"),
+            "rule_name": rule.get("name", "Unknown"),
+            "algorithm": rule.get("algorithm"),
+            "severity": rule.get("severity", "warning"),
+            "score": result.get("score"),
+            "details": result.get("details"),
+            "timestamp": float(timestamp),
+            "source": source,
+            "tags": tags or {},
+        }
+        saved, action = escalator.process_anomaly(alert, rule)
+        saved["_action"] = action
+        results.append(saved)
+    return results
+
+
+
 class TimeSeriesHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the time-series API."""
 
     storage: TimeSeriesStorage = None
     detector: AnomalyDetector = None
+    escalator: EscalationManager = None
 
     def log_message(self, format, *args):
         """Suppress default logging for cleaner output."""
@@ -97,6 +136,8 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
                 self._handle_dashboard(query)
             elif path == '/api/alerts':
                 self._handle_get_alerts(query)
+            elif path == '/api/notifications':
+                self._handle_get_notifications(query)
             elif path == '/api/rules':
                 self._handle_get_rules()
             elif path == '/api/sources':
@@ -183,27 +224,18 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         # Store the data point
         self.storage.write(metric, float(timestamp), float(value), tags, source)
 
-        # Run anomaly detection
-        anomaly_result = None
-        for rule in self.storage.get_rules():
-            if rule.get("metric") == metric and rule.get("enabled", True):
-                is_anomaly, result = self.detector.detect(metric, float(value), rule)
-                if is_anomaly:
-                    alert = {
-                        "metric": metric,
-                        "value": float(value),
-                        "rule_id": rule.get("id"),
-                        "rule_name": rule.get("name", "Unknown"),
-                        "algorithm": rule.get("algorithm"),
-                        "severity": rule.get("severity", "warning"),
-                        "score": result.get("score"),
-                        "details": result.get("details"),
-                        "timestamp": float(timestamp),
-                        "source": source,
-                        "tags": tags
-                    }
-                    saved_alert = self.storage.add_alert(alert)
-                    anomaly_result = saved_alert
+        # Run anomaly detection (with escalation handling)
+        alerts = process_point(
+            self.storage, self.detector, self.escalator,
+            metric, value, float(timestamp), source, tags
+        )
+        # Only surface newly created or escalated alerts as "anomaly_detected"
+        anomaly_result = next(
+            (a for a in alerts if a.get("_action") in ("created", "escalated")),
+            None
+        )
+        if anomaly_result is not None:
+            anomaly_result.pop("_action", None)
 
         self._send_json({
             "success": True,
@@ -224,29 +256,21 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
 
         self.storage.write_batch(points)
 
-        # Run anomaly detection on each point
+        # Run anomaly detection on each point (with escalation handling)
         anomalies = []
         for p in points:
             metric = p.get("metric", "")
             value = p.get("value", 0)
-            for rule in self.storage.get_rules():
-                if rule.get("metric") == metric and rule.get("enabled", True):
-                    is_anomaly, result = self.detector.detect(metric, float(value), rule)
-                    if is_anomaly:
-                        alert = {
-                            "metric": metric,
-                            "value": float(value),
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": p.get("timestamp", time.time()),
-                            "source": p.get("source", "default")
-                        }
-                        saved = self.storage.add_alert(alert)
-                        anomalies.append(saved)
+            alerts = process_point(
+                self.storage, self.detector, self.escalator,
+                metric, value,
+                float(p.get("timestamp", time.time())),
+                p.get("source", "default"),
+                p.get("tags", {}),
+            )
+            for a in alerts:
+                a.pop("_action", None)
+                anomalies.append(a)
 
         self._send_json({
             "success": True,
@@ -344,6 +368,12 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         alerts = self.storage.get_alerts(status=status, severity=severity, limit=limit)
         self._send_json({"alerts": alerts, "count": len(alerts)})
 
+    def _handle_get_notifications(self, query: Dict):
+        """Get escalation notifications."""
+        limit = int(query.get("limit", [100])[0])
+        notes = self.storage.get_notifications(limit=limit)
+        self._send_json({"notifications": notes, "count": len(notes)})
+
     def _handle_acknowledge_alert(self):
         """Acknowledge an alert."""
         body = self._read_body()
@@ -423,7 +453,7 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         # Start simulation in background
         sim_thread = threading.Thread(
             target=_run_simulation,
-            args=(self.storage, self.detector, metrics, duration, interval),
+            args=(self.storage, self.detector, self.escalator, metrics, duration, interval),
             daemon=True
         )
         sim_thread.start()
@@ -516,6 +546,7 @@ class DataSimulator:
 
 
 def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
+                    escalator: EscalationManager,
                     metrics: list, duration: int, interval: float):
     """Run data simulation in background."""
     sim = DataSimulator()
@@ -538,25 +569,12 @@ def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
 
         storage.write_batch(points)
 
-        # Run anomaly detection
+        # Run anomaly detection (with escalation handling)
         for p in points:
-            for rule in storage.get_rules():
-                if rule.get("metric") == p["metric"] and rule.get("enabled", True):
-                    is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
-                    if is_anomaly:
-                        alert = {
-                            "metric": p["metric"],
-                            "value": p["value"],
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": ts,
-                            "source": "simulator"
-                        }
-                        storage.add_alert(alert)
+            process_point(
+                storage, detector, escalator,
+                p["metric"], p["value"], ts, "simulator", p.get("tags", {})
+            )
 
         count += len(points)
         time.sleep(interval)
@@ -572,6 +590,19 @@ SERVER_START_TIME = time.time()
 
 def create_default_rules(storage: TimeSeriesStorage):
     """Create default anomaly detection rules."""
+    # Demo-friendly escalation policy: 3 triggers within 2 minutes or
+    # 3 minutes unhandled -> raise to critical and notify.
+    demo_escalation = {
+        "enabled": True,
+        "repeat_window": 120,
+        "repeat_threshold": 3,
+        "repeat_target": "critical",
+        "timeout": 180,
+        "timeout_target": "critical",
+        "notify": True,
+        "channels": ["system"]
+    }
+
     default_rules = [
         {
             "id": "rule_cpu_zscore",
@@ -583,6 +614,7 @@ def create_default_rules(storage: TimeSeriesStorage):
             "enabled": True,
             "dynamic_threshold": True,
             "params": {"window_size": 200},
+            "escalation": dict(demo_escalation),
             "description": "Detects CPU spikes using Z-score"
         },
         {
@@ -595,6 +627,7 @@ def create_default_rules(storage: TimeSeriesStorage):
             "enabled": True,
             "dynamic_threshold": False,
             "params": {"alpha": 0.3},
+            "escalation": dict(demo_escalation),
             "description": "Detects memory drift using EWMA"
         },
         {
@@ -607,6 +640,7 @@ def create_default_rules(storage: TimeSeriesStorage):
             "enabled": True,
             "dynamic_threshold": True,
             "params": {"window_size": 100},
+            "escalation": dict(demo_escalation),
             "description": "Detects disk I/O anomalies using moving median"
         },
         {
@@ -619,6 +653,7 @@ def create_default_rules(storage: TimeSeriesStorage):
             "enabled": True,
             "dynamic_threshold": False,
             "params": {"window_size": 150},
+            "escalation": dict(demo_escalation),
             "description": "Detects network anomalies"
         }
     ]
@@ -661,14 +696,19 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
     # Initialize components
     storage = TimeSeriesStorage(data_dir)
     detector = AnomalyDetector()
+    escalator = EscalationManager(storage, detector)
 
     # Set class-level attributes
     TimeSeriesHandler.storage = storage
     TimeSeriesHandler.detector = detector
+    TimeSeriesHandler.escalator = escalator
 
     # Create defaults
     create_default_rules(storage)
     create_default_sources(storage)
+
+    # Start timeout-escalation background sweep
+    escalator.start()
 
     # Create server
     server = ThreadedHTTPServer((host, port), TimeSeriesHandler)
@@ -702,25 +742,12 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
 
             storage.write_batch(points)
 
-            # Anomaly detection
+            # Anomaly detection (with escalation handling)
             for p in points:
-                for rule in storage.get_rules():
-                    if rule.get("metric") == p["metric"] and rule.get("enabled", True):
-                        is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
-                        if is_anomaly:
-                            alert = {
-                                "metric": p["metric"],
-                                "value": p["value"],
-                                "rule_id": rule.get("id"),
-                                "rule_name": rule.get("name", "Unknown"),
-                                "algorithm": rule.get("algorithm"),
-                                "severity": rule.get("severity", "warning"),
-                                "score": result.get("score"),
-                                "details": result.get("details"),
-                                "timestamp": ts,
-                                "source": "auto-simulator"
-                            }
-                            storage.add_alert(alert)
+                process_point(
+                    storage, detector, escalator,
+                    p["metric"], p["value"], ts, "auto-simulator", p.get("tags", {})
+                )
 
             time.sleep(1)
 
