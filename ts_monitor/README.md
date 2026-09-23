@@ -9,13 +9,14 @@ ts_monitor/
 ├── server.py          # HTTP API 服务器（多线程）
 ├── storage.py         # 时序数据存储引擎（JSON 分片）
 ├── anomaly.py         # 异常检测算法（Z-score/EWMA/移动中位数）
+├── escalation.py      # 告警升级引擎（重复升级/超时升级/通知）
 ├── downsample.py      # LTTB 降采样算法
 ├── run.sh             # 启动脚本
 ├── data/              # 数据目录
 │   ├── timeseries/    # 按小时分片的时序数据
 │   ├── metadata.json  # 数据源元数据
-│   ├── rules.json     # 检测规则
-│   └── alerts.json    # 告警记录
+│   ├── rules.json     # 检测规则（含升级策略）
+│   └── alerts.json    # 告警事件单、升级历史与通知记录
 └── ../ts_dashboard.html  # 前端仪表盘
 ```
 
@@ -35,8 +36,8 @@ python3 server.py 8080
 1. **实时仪表盘** - ECharts 多指标曲线图、热力图、统计卡片
 2. **数据源配置** - 管理 API/模拟器/文件数据源
 3. **历史查询** - 时间范围选择、LTTB 降采样、CSV 导出
-4. **异常告警** - 告警列表、状态过滤、确认/解决操作
-5. **规则管理** - CRUD 检测规则、多算法配置
+4. **异常告警** - 告警列表、状态过滤、确认/解决操作、升级历史时间线
+5. **规则管理** - CRUD 检测规则、多算法配置、告警升级策略配置
 
 ### 后端核心能力
 
@@ -49,7 +50,10 @@ python3 server.py 8080
 | EWMA 检测 | 指数加权移动平均，检测渐变漂移 |
 | 移动中位数 | 基于 MAD 的鲁棒异常检测 |
 | 动态阈值 | 基于百分位数的自适应阈值 |
-| 告警去重 | 5 分钟窗口抑制相同指标+规则的重复告警 |
+| 告警事件单 | 相同指标+规则的重复触发合并到同一事件单，累计重复次数 |
+| 告警升级 | 重复触发自动升级 + 超时未处理升级/通知，规则页面可配置 |
+| 升级通知 | 升级时记录通知日志，支持配置 Webhook 外发 |
+| 升级历史 | 每条告警保留完整的触发/升级/通知/确认/解决时间线 |
 
 ## API 接口
 
@@ -106,7 +110,49 @@ curl -X POST http://localhost:8080/api/alerts/acknowledge \
 # 解决告警
 curl -X POST http://localhost:8080/api/alerts/resolve \
   -d '{"alert_id":"alert_xxx"}'
+
+# 查看告警的升级历史（时间线）
+curl http://localhost:8080/api/alerts/alert_xxx/history
+
+# 查看升级通知记录
+curl http://localhost:8080/api/notifications
 ```
+
+### 告警升级机制
+
+每个检测规则可配置升级策略（规则管理页面或 `POST /api/rules` 的 `escalation` 字段）：
+
+```json
+{
+  "name": "CPU异常", "metric": "cpu.usage", "algorithm": "zscore", "threshold": 3.0,
+  "severity": "warning",
+  "escalation": {
+    "enabled": true,
+
+    "repeat_enabled": true,
+    "repeat_window": 300,
+    "repeat_count": 3,
+    "repeat_severity": "critical",
+
+    "timeout_enabled": true,
+    "timeout_stages": [
+      {"after_seconds": 60, "action": "escalate", "severity": "critical"},
+      {"after_seconds": 300, "action": "notify", "message": "持续 5 分钟未处理"}
+    ],
+
+    "webhook_url": ""
+  }
+}
+```
+
+- **重复触发升级**：同一指标+规则的告警在 `repeat_window` 秒内重复触发达到
+  `repeat_count` 次时，事件单自动从当前级别提升到 `repeat_severity`（仅升级一次）。
+- **超时未处理升级**：活跃（未确认）告警持续超过 `after_seconds` 秒后，按阶段执行
+  `escalate`（提升级别并通知）或 `notify`（级别不变，再次发送通知）。确认告警后
+  超时升级暂停；解决后再次触发会创建新的事件单。
+- 级别阶梯：`info < warning < critical`，升级不会降级。
+- 每次升级/通知都会写入告警 `history`，并产生一条通知记录（日志通道，配置了
+  `webhook_url` 时同时以 JSON POST 外发）。
 
 ### 模拟器
 
@@ -166,7 +212,8 @@ data/timeseries/
 | JSON 分片性能 | 原子写入（tmp + rename），限制单分片大小 |
 | 窗口状态内存 | deque 固定大小，增量统计量更新 |
 | 跨分片合并 | 按需加载分片，内存缓存最近 2 小时数据 |
-| 告警风暴 | 5 分钟窗口去重，相同指标+规则的告警自动抑制 |
+| 告警风暴 | 相同指标+规则的重复触发合并到同一事件单并计数，由升级策略统一处理 |
+| 升级检查 | 后台守护线程每 5 秒扫描活跃告警，阶段触发幂等，确认后暂停 |
 
 ## 依赖
 

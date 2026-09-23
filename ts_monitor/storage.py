@@ -10,6 +10,8 @@ import json
 import os
 import time
 import threading
+import uuid
+import copy
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
@@ -40,7 +42,15 @@ class TimeSeriesStorage:
         # Load metadata and rules
         self.metadata = self._load_json(self.meta_file, {"sources": {}, "stats": {}})
         self.rules = self._load_json(self.rules_file, {"rules": []})
-        self.alerts = self._load_json(self.alerts_file, {"alerts": [], "suppressed": {}})
+        self.alerts = self._load_json(
+            self.alerts_file,
+            {"alerts": [], "suppressed": {}, "notifications": []}
+        )
+        # Backward compatibility: ensure notifications list exists
+        self.alerts.setdefault("notifications", [])
+
+        # Guards all in-memory alert/rule mutations and JSON persistence
+        self._alert_lock = threading.RLock()
 
     def _load_json(self, path: str, default: Any) -> Any:
         """Load JSON file with fallback to default."""
@@ -290,100 +300,246 @@ class TimeSeriesStorage:
 
     def add_rule(self, rule: Dict) -> Dict:
         """Add or update an anomaly detection rule."""
-        rule_id = rule.get("id", f"rule_{int(time.time()*1000)}")
-        rule["id"] = rule_id
-        rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with self._alert_lock:
+            rule_id = rule.get("id", f"rule_{int(time.time()*1000)}")
+            rule["id"] = rule_id
+            rule["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        # Update existing or add new
-        existing = [r for r in self.rules["rules"] if r["id"] != rule_id]
-        existing.append(rule)
-        self.rules["rules"] = existing
+            # Update existing or add new
+            existing = [r for r in self.rules["rules"] if r["id"] != rule_id]
+            existing.append(rule)
+            self.rules["rules"] = existing
 
-        self._save_json(self.rules_file, self.rules)
-        return rule
+            self._save_json(self.rules_file, self.rules)
+            return copy.deepcopy(rule)
 
     def delete_rule(self, rule_id: str) -> bool:
         """Delete an anomaly detection rule."""
-        before = len(self.rules["rules"])
-        self.rules["rules"] = [r for r in self.rules["rules"] if r["id"] != rule_id]
-        if len(self.rules["rules"]) < before:
-            self._save_json(self.rules_file, self.rules)
-            return True
-        return False
+        with self._alert_lock:
+            before = len(self.rules["rules"])
+            self.rules["rules"] = [r for r in self.rules["rules"] if r["id"] != rule_id]
+            if len(self.rules["rules"]) < before:
+                self._save_json(self.rules_file, self.rules)
+                return True
+            return False
 
-    # ---- Alerts ----
+    # ---- Alerts (incident model with escalation history) ----
 
     def get_alerts(self, status: Optional[str] = None,
                    severity: Optional[str] = None,
                    limit: int = 200) -> List[Dict]:
-        """Get alerts with optional filtering."""
-        alerts = self.alerts.get("alerts", [])
+        """Get alerts with optional filtering (returns copies)."""
+        with self._alert_lock:
+            alerts = copy.deepcopy(self.alerts.get("alerts", []))
         if status:
             alerts = [a for a in alerts if a.get("status") == status]
         if severity:
             alerts = [a for a in alerts if a.get("severity") == severity]
-        return sorted(alerts, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+        return sorted(alerts, key=lambda x: x.get("last_time", x.get("timestamp", 0)),
+                      reverse=True)[:limit]
+
+    def get_open_alerts(self) -> List[Dict]:
+        """Get active/acknowledged alerts (the still-open incidents)."""
+        with self._alert_lock:
+            return copy.deepcopy([
+                a for a in self.alerts.get("alerts", [])
+                if a.get("status") in ("active", "acknowledged")
+            ])
+
+    def get_alert(self, alert_id: str) -> Optional[Dict]:
+        """Get a single alert by id (returns a copy)."""
+        with self._alert_lock:
+            for a in self.alerts.get("alerts", []):
+                if a.get("id") == alert_id:
+                    return copy.deepcopy(a)
+        return None
 
     def add_alert(self, alert: Dict) -> Dict:
-        """Add a new alert with deduplication."""
-        alert_id = alert.get("id", f"alert_{int(time.time()*1000)}")
-        alert["id"] = alert_id
-        alert["timestamp"] = alert.get("timestamp", time.time())
-        alert["status"] = alert.get("status", "active")
+        """
+        Add an anomaly event.
 
-        # Check for duplicate/suppressed alerts
-        suppressed = self.alerts.get("suppressed", {})
-        metric = alert.get("metric", "")
-        rule_id = alert.get("rule_id", "")
-        suppress_key = f"{metric}:{rule_id}"
+        If an open (active/acknowledged) alert with the same metric+rule
+        exists, the event is merged into that incident: the repeat counter
+        is incremented instead of creating a new alert. This replaces the
+        old fixed 5-minute suppression with incident-based grouping which
+        the escalation engine uses for repeat-trigger escalation.
 
-        # Suppress if same metric+rule had an alert in the last 5 minutes
-        if suppress_key in suppressed:
-            last_alert_time = suppressed[suppress_key]
-            if time.time() - last_alert_time < 300:  # 5 min suppression
-                alert["status"] = "suppressed"
-                return alert
+        Returns a copy of the alert. When merged, the returned dict carries
+        a transient ``merged=True`` flag.
+        """
+        with self._alert_lock:
+            metric = alert.get("metric", "")
+            rule_id = alert.get("rule_id", "")
+            now = float(alert.get("timestamp", time.time()))
 
-        suppressed[suppress_key] = time.time()
-        self.alerts["suppressed"] = suppressed
+            # Merge into an existing open incident for the same metric+rule
+            existing = None
+            for a in self.alerts.get("alerts", []):
+                if (a.get("metric") == metric and a.get("rule_id") == rule_id
+                        and a.get("status") in ("active", "acknowledged")):
+                    existing = a
+                    break
 
-        self.alerts["alerts"].append(alert)
-        # Keep only last 1000 alerts
-        if len(self.alerts["alerts"]) > 1000:
-            self.alerts["alerts"] = self.alerts["alerts"][-1000:]
+            if existing is not None:
+                existing["repeat_count"] = existing.get("repeat_count", 1) + 1
+                existing["last_time"] = now
+                existing["last_value"] = alert.get("value")
+                if alert.get("score") is not None:
+                    existing["last_score"] = alert.get("score")
+                # Rolling list of trigger timestamps (used for repeat escalation)
+                triggers = existing.setdefault(
+                    "trigger_times", [existing.get("timestamp", now)]
+                )
+                triggers.append(now)
+                # Only the recent window matters; keep the list bounded
+                existing["trigger_times"] = triggers[-500:]
+                self._save_json(self.alerts_file, self.alerts)
+                result = copy.deepcopy(existing)
+                result["merged"] = True
+                return result
 
-        self._save_json(self.alerts_file, self.alerts)
-        return alert
+            # New incident
+            alert_id = f"alert_{uuid.uuid4().hex[:12]}"
+            alert["id"] = alert_id
+            alert["timestamp"] = now
+            alert["status"] = alert.get("status", "active")
+            alert["repeat_count"] = 1
+            alert["escalation_count"] = 0
+            alert["trigger_times"] = [now]
+            alert["history"] = [{
+                "type": "created",
+                "label": "告警触发",
+                "timestamp": now,
+                "from_severity": None,
+                "to_severity": alert.get("severity", "warning"),
+                "detail": f"检测算法 {alert.get('algorithm', '-')} 首次触发，"
+                          f"当前值 {alert.get('value')}"
+            }]
+
+            self.alerts["alerts"].append(alert)
+            # Keep only last 1000 alerts
+            if len(self.alerts["alerts"]) > 1000:
+                self.alerts["alerts"] = self.alerts["alerts"][-1000:]
+
+            self._save_json(self.alerts_file, self.alerts)
+            return copy.deepcopy(alert)
+
+    def update_alert(self, alert_id: str, fields: Dict,
+                     history_entry: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        Update fields of an alert and optionally append an escalation
+        history entry. Returns the updated alert copy, or None if missing.
+        """
+        with self._alert_lock:
+            alert = None
+            for a in self.alerts.get("alerts", []):
+                if a.get("id") == alert_id:
+                    alert = a
+                    break
+            if alert is None:
+                return None
+
+            alert.update(fields)
+            if history_entry:
+                entry = {"timestamp": time.time(), **history_entry}
+                alert.setdefault("history", []).append(entry)
+                alert["history"] = alert["history"][-100:]
+                # Escalation entries actually change the alert's severity
+                to_sev = entry.get("to_severity")
+                if to_sev and entry.get("type") in (
+                        "repeat_escalated", "timeout_escalated", "manual_escalated"):
+                    alert["severity"] = to_sev
+                alert["escalation_count"] = alert.get("escalation_count", 0) + 1
+            self._save_json(self.alerts_file, self.alerts)
+            return copy.deepcopy(alert)
+
+    def append_alert_history(self, alert_id: str, entry: Dict,
+                             bump_escalation: bool = False) -> Optional[Dict]:
+        """Append a history entry (without changing severity)."""
+        with self._alert_lock:
+            alert = None
+            for a in self.alerts.get("alerts", []):
+                if a.get("id") == alert_id:
+                    alert = a
+                    break
+            if alert is None:
+                return None
+            alert.setdefault("history", []).append(
+                {"timestamp": time.time(), **entry}
+            )
+            alert["history"] = alert["history"][-100:]
+            if bump_escalation:
+                alert["escalation_count"] = alert.get("escalation_count", 0) + 1
+            self._save_json(self.alerts_file, self.alerts)
+            return copy.deepcopy(alert)
 
     def acknowledge_alert(self, alert_id: str) -> bool:
         """Acknowledge an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "acknowledged"
-                alert["acknowledged_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
-        return False
+        with self._alert_lock:
+            for alert in self.alerts.get("alerts", []):
+                if alert.get("id") == alert_id:
+                    if alert.get("status") == "active":
+                        alert["status"] = "acknowledged"
+                        alert["acknowledged_at"] = time.time()
+                        alert.setdefault("history", []).append({
+                            "type": "acknowledged",
+                            "label": "告警确认",
+                            "timestamp": time.time(),
+                            "detail": "运维人员已确认告警，超时升级暂停"
+                        })
+                        self._save_json(self.alerts_file, self.alerts)
+                    return True
+            return False
 
     def resolve_alert(self, alert_id: str) -> bool:
         """Resolve an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "resolved"
-                alert["resolved_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
-        return False
+        with self._alert_lock:
+            for alert in self.alerts.get("alerts", []):
+                if alert.get("id") == alert_id:
+                    if alert.get("status") != "resolved":
+                        alert["status"] = "resolved"
+                        alert["resolved_at"] = time.time()
+                        alert.setdefault("history", []).append({
+                            "type": "resolved",
+                            "label": "告警解决",
+                            "timestamp": time.time(),
+                            "detail": "告警已处理并关闭"
+                        })
+                        self._save_json(self.alerts_file, self.alerts)
+                    return True
+            return False
+
+    # ---- Escalation notifications ----
+
+    def add_notification(self, notification: Dict) -> Dict:
+        """Persist an escalation notification record."""
+        with self._alert_lock:
+            notification.setdefault("id", f"ntf_{uuid.uuid4().hex[:12]}")
+            notification.setdefault("timestamp", time.time())
+            notifications = self.alerts.setdefault("notifications", [])
+            notifications.append(notification)
+            if len(notifications) > 500:
+                self.alerts["notifications"] = notifications[-500:]
+            self._save_json(self.alerts_file, self.alerts)
+            return copy.deepcopy(notification)
+
+    def get_notifications(self, limit: int = 100) -> List[Dict]:
+        """Get recent escalation notifications (newest first)."""
+        with self._alert_lock:
+            notifications = copy.deepcopy(self.alerts.get("notifications", []))
+        return sorted(notifications, key=lambda x: x.get("timestamp", 0),
+                      reverse=True)[:limit]
 
     def cleanup_suppressed(self):
-        """Clean up old suppression entries."""
-        suppressed = self.alerts.get("suppressed", {})
-        now = time.time()
-        self.alerts["suppressed"] = {
-            k: v for k, v in suppressed.items()
-            if now - v < 600  # Keep 10 minutes of suppression history
-        }
-        self._save_json(self.alerts_file, self.alerts)
+        """Clean up old suppression entries (legacy compatibility)."""
+        with self._alert_lock:
+            suppressed = self.alerts.get("suppressed", {})
+            now = time.time()
+            self.alerts["suppressed"] = {
+                k: v for k, v in suppressed.items()
+                if now - v < 600  # Keep 10 minutes of suppression history
+            }
+            self._save_json(self.alerts_file, self.alerts)
 
     def get_stats(self) -> Dict:
         """Get storage statistics."""

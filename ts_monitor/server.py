@@ -6,6 +6,7 @@ Time-Series Monitoring Server
 """
 
 import json
+import os
 import time
 import threading
 import random
@@ -19,6 +20,38 @@ from typing import Dict, Any, Optional
 from storage import TimeSeriesStorage
 from anomaly import AnomalyDetector
 from downsample import downsample_simple
+from escalation import EscalationManager, normalize_escalation_config
+
+
+def _fire_anomaly_alert(storage: TimeSeriesStorage,
+                        escalation: Optional[EscalationManager],
+                        metric: str, value: float, rule: Dict,
+                        result: Dict, timestamp: float,
+                        source: str = "default",
+                        tags: Optional[Dict] = None) -> Dict:
+    """
+    Persist an anomaly event and run it through the escalation engine.
+    Repeated events merge into the open incident instead of creating
+    duplicate alerts.
+    """
+    alert = {
+        "metric": metric,
+        "value": float(value),
+        "rule_id": rule.get("id"),
+        "rule_name": rule.get("name", "Unknown"),
+        "algorithm": rule.get("algorithm"),
+        "severity": rule.get("severity", "warning"),
+        "score": result.get("score"),
+        "details": result.get("details"),
+        "timestamp": float(timestamp),
+        "source": source,
+        "tags": tags or {},
+    }
+    saved = storage.add_alert(alert)
+    if escalation is not None:
+        saved = escalation.process_anomaly_alert(saved)
+    return saved
+
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -32,6 +65,7 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
 
     storage: TimeSeriesStorage = None
     detector: AnomalyDetector = None
+    escalation: EscalationManager = None
 
     def log_message(self, format, *args):
         """Suppress default logging for cleaner output."""
@@ -97,6 +131,11 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
                 self._handle_dashboard(query)
             elif path == '/api/alerts':
                 self._handle_get_alerts(query)
+            elif path == '/api/notifications':
+                self._handle_get_notifications(query)
+            elif path.startswith('/api/alerts/') and path.endswith('/history'):
+                alert_id = path.split('/')[3]
+                self._handle_get_alert_history(alert_id)
             elif path == '/api/rules':
                 self._handle_get_rules()
             elif path == '/api/sources':
@@ -164,6 +203,7 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             "version": "1.0.0",
             "uptime": time.time() - SERVER_START_TIME,
             "storage": stats,
+            "escalation": self.escalation.get_stats() if self.escalation else {},
             "timestamp": time.time()
         })
 
@@ -189,21 +229,11 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             if rule.get("metric") == metric and rule.get("enabled", True):
                 is_anomaly, result = self.detector.detect(metric, float(value), rule)
                 if is_anomaly:
-                    alert = {
-                        "metric": metric,
-                        "value": float(value),
-                        "rule_id": rule.get("id"),
-                        "rule_name": rule.get("name", "Unknown"),
-                        "algorithm": rule.get("algorithm"),
-                        "severity": rule.get("severity", "warning"),
-                        "score": result.get("score"),
-                        "details": result.get("details"),
-                        "timestamp": float(timestamp),
-                        "source": source,
-                        "tags": tags
-                    }
-                    saved_alert = self.storage.add_alert(alert)
-                    anomaly_result = saved_alert
+                    anomaly_result = _fire_anomaly_alert(
+                        self.storage, self.escalation,
+                        metric, float(value), rule, result,
+                        float(timestamp), source, tags
+                    )
 
         self._send_json({
             "success": True,
@@ -229,23 +259,16 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         for p in points:
             metric = p.get("metric", "")
             value = p.get("value", 0)
+            ts = float(p.get("timestamp", time.time()))
             for rule in self.storage.get_rules():
                 if rule.get("metric") == metric and rule.get("enabled", True):
                     is_anomaly, result = self.detector.detect(metric, float(value), rule)
                     if is_anomaly:
-                        alert = {
-                            "metric": metric,
-                            "value": float(value),
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": p.get("timestamp", time.time()),
-                            "source": p.get("source", "default")
-                        }
-                        saved = self.storage.add_alert(alert)
+                        saved = _fire_anomaly_alert(
+                            self.storage, self.escalation,
+                            metric, float(value), rule, result,
+                            ts, p.get("source", "default"), p.get("tags", {})
+                        )
                         anomalies.append(saved)
 
         self._send_json({
@@ -366,9 +389,37 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         success = self.storage.resolve_alert(alert_id)
         self._send_json({"success": success})
 
+    def _handle_get_alert_history(self, alert_id: str):
+        """Get the escalation history timeline of an alert."""
+        alert = self.storage.get_alert(alert_id)
+        if not alert:
+            self._send_error("Alert not found", 404)
+            return
+        self._send_json({
+            "alert_id": alert_id,
+            "history": alert.get("history", []),
+            "escalation_count": alert.get("escalation_count", 0),
+            "repeat_count": alert.get("repeat_count", 1),
+        })
+
+    def _handle_get_notifications(self, query: Dict):
+        """Get recent escalation notifications."""
+        limit = int(query.get("limit", [100])[0])
+        notifications = self.storage.get_notifications(limit=limit)
+        self._send_json({
+            "notifications": notifications,
+            "count": len(notifications),
+            "escalation_stats": self.escalation.get_stats() if self.escalation else {},
+        })
+
     def _handle_get_rules(self):
         """Get all rules."""
-        rules = self.storage.get_rules()
+        # Expose the effective escalation policy (defaults filled in)
+        rules = []
+        for rule in self.storage.get_rules():
+            rule = dict(rule)
+            rule["escalation"] = normalize_escalation_config(rule)
+            rules.append(rule)
         self._send_json({"rules": rules, "count": len(rules)})
 
     def _handle_add_rule(self):
@@ -378,6 +429,8 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
             self._send_error("Missing 'metric' or 'algorithm'")
             return
 
+        # Normalize / fill defaults for the escalation policy
+        body["escalation"] = normalize_escalation_config(body)
         rule = self.storage.add_rule(body)
         self._send_json({"success": True, "rule": rule})
 
@@ -423,7 +476,8 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         # Start simulation in background
         sim_thread = threading.Thread(
             target=_run_simulation,
-            args=(self.storage, self.detector, metrics, duration, interval),
+            args=(self.storage, self.detector, metrics, duration, interval,
+                  self.escalation),
             daemon=True
         )
         sim_thread.start()
@@ -516,7 +570,8 @@ class DataSimulator:
 
 
 def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
-                    metrics: list, duration: int, interval: float):
+                    metrics: list, duration: int, interval: float,
+                    escalation: Optional[EscalationManager] = None):
     """Run data simulation in background."""
     sim = DataSimulator()
     start = time.time()
@@ -544,19 +599,11 @@ def _run_simulation(storage: TimeSeriesStorage, detector: AnomalyDetector,
                 if rule.get("metric") == p["metric"] and rule.get("enabled", True):
                     is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
                     if is_anomaly:
-                        alert = {
-                            "metric": p["metric"],
-                            "value": p["value"],
-                            "rule_id": rule.get("id"),
-                            "rule_name": rule.get("name", "Unknown"),
-                            "algorithm": rule.get("algorithm"),
-                            "severity": rule.get("severity", "warning"),
-                            "score": result.get("score"),
-                            "details": result.get("details"),
-                            "timestamp": ts,
-                            "source": "simulator"
-                        }
-                        storage.add_alert(alert)
+                        _fire_anomaly_alert(
+                            storage, escalation,
+                            p["metric"], p["value"], rule, result,
+                            ts, "simulator"
+                        )
 
         count += len(points)
         time.sleep(interval)
@@ -661,14 +708,19 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
     # Initialize components
     storage = TimeSeriesStorage(data_dir)
     detector = AnomalyDetector()
+    escalation = EscalationManager(storage, check_interval=5.0)
 
     # Set class-level attributes
     TimeSeriesHandler.storage = storage
     TimeSeriesHandler.detector = detector
+    TimeSeriesHandler.escalation = escalation
 
     # Create defaults
     create_default_rules(storage)
     create_default_sources(storage)
+
+    # Start background timeout-escalation checker
+    escalation.start()
 
     # Create server
     server = ThreadedHTTPServer((host, port), TimeSeriesHandler)
@@ -708,19 +760,11 @@ def run_server(host: str = "0.0.0.0", port: int = 8080, data_dir: str = "./data"
                     if rule.get("metric") == p["metric"] and rule.get("enabled", True):
                         is_anomaly, result = detector.detect(p["metric"], p["value"], rule)
                         if is_anomaly:
-                            alert = {
-                                "metric": p["metric"],
-                                "value": p["value"],
-                                "rule_id": rule.get("id"),
-                                "rule_name": rule.get("name", "Unknown"),
-                                "algorithm": rule.get("algorithm"),
-                                "severity": rule.get("severity", "warning"),
-                                "score": result.get("score"),
-                                "details": result.get("details"),
-                                "timestamp": ts,
-                                "source": "auto-simulator"
-                            }
-                            storage.add_alert(alert)
+                            _fire_anomaly_alert(
+                                storage, escalation,
+                                p["metric"], p["value"], rule, result,
+                                ts, "auto-simulator", p.get("tags", {})
+                            )
 
             time.sleep(1)
 

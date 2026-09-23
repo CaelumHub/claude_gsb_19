@@ -663,6 +663,95 @@ textarea.form-input {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ---- Escalation ---- */
+.badge-escalated {
+  background: rgba(239, 68, 68, .18);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, .4);
+}
+
+.alert-item.escalated {
+  background: linear-gradient(90deg, rgba(239,68,68,.07), transparent 40%);
+}
+
+.escalation-toggle {
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+}
+
+.esc-history {
+  grid-column: 1 / -1;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.esc-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 6px;
+}
+
+.esc-timeline li {
+  position: relative;
+  padding: 6px 0 6px 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-left: 2px solid var(--border);
+}
+
+.esc-timeline li::before {
+  content: '';
+  position: absolute;
+  left: -5px;
+  top: 11px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.esc-timeline li.t-escalated::before { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.esc-timeline li.t-notified::before { background: var(--warning); }
+.esc-timeline li.t-acknowledged::before { background: var(--accent); }
+.esc-timeline li.t-resolved::before { background: var(--success); }
+.esc-timeline li.t-repeat::before { background: var(--purple); }
+
+.esc-timeline .esc-time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-right: 8px;
+}
+
+.esc-timeline .esc-sev-change {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.esc-rule-summary {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.history-btn {
+  cursor: pointer;
+  user-select: none;
+  text-decoration: none underline dotted;
 }
 
 /* ---- Time Range Picker ---- */
@@ -1345,6 +1434,7 @@ textarea.form-input {
               <option value="info">信息</option>
             </select>
             <button class="btn" onclick="loadAlerts()">🔄 刷新</button>
+            <button class="btn" onclick="loadNotifications(true)">📢 升级通知</button>
           </div>
         </div>
 
@@ -1364,6 +1454,10 @@ textarea.form-input {
           <div class="stat-card blue">
             <div class="stat-label">已抑制</div>
             <div class="stat-value" id="suppressedAlerts">0</div>
+          </div>
+          <div class="stat-card red">
+            <div class="stat-label">已升级</div>
+            <div class="stat-value" id="escalatedAlerts">0</div>
           </div>
         </div>
 
@@ -1450,6 +1544,72 @@ textarea.form-input {
           启用规则
         </label>
       </div>
+
+      <!-- Escalation policy -->
+      <div class="form-group escalation-toggle">
+        <label class="form-checkbox" style="font-weight:600">
+          <input type="checkbox" id="ruleEscEnabled" checked onchange="toggleEscalationFields()">
+          🔺 启用告警升级策略
+        </label>
+        <div id="escFields" style="margin-top:12px">
+          <div class="form-group">
+            <label class="form-checkbox">
+              <input type="checkbox" id="ruleEscRepeatEnabled" checked>
+              重复触发自动升级
+            </label>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">时间窗口 (秒)</label>
+              <input class="form-input" id="ruleEscRepeatWindow" type="number" value="300" min="10">
+            </div>
+            <div class="form-group">
+              <label class="form-label">触发次数 ≥</label>
+              <input class="form-input" id="ruleEscRepeatCount" type="number" value="3" min="2">
+            </div>
+            <div class="form-group">
+              <label class="form-label">升级到级别</label>
+              <select class="form-select" id="ruleEscRepeatSeverity">
+                <option value="warning">警告</option>
+                <option value="critical" selected>严重</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-checkbox">
+              <input type="checkbox" id="ruleEscTimeoutEnabled" checked>
+              超时未处理自动升级/通知
+            </label>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">升级超时 (秒，0=禁用)</label>
+              <input class="form-input" id="ruleEscTimeoutEsc" type="number" value="60" min="0">
+            </div>
+            <div class="form-group">
+              <label class="form-label">升级级别</label>
+              <select class="form-select" id="ruleEscTimeoutSeverity">
+                <option value="warning">警告</option>
+                <option value="critical" selected>严重</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">再次通知超时 (秒，0=禁用)</label>
+              <input class="form-input" id="ruleEscTimeoutNotify" type="number" value="300" min="0">
+            </div>
+            <div class="form-group">
+              <label class="form-label">通知 Webhook (可选)</label>
+              <input class="form-input" id="ruleEscWebhook" placeholder="https://...">
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-muted)">
+            说明：告警确认后将暂停超时升级；同一指标+规则的重复触发会合并到同一告警事件单。
+          </div>
+        </div>
+      </div>
+
       <div class="form-group">
         <label class="form-label">描述</label>
         <textarea class="form-input" id="ruleDescription" placeholder="规则说明..."></textarea>
@@ -1509,6 +1669,23 @@ textarea.form-input {
 <!-- Toast Container -->
 <div class="toast-container" id="toastContainer"></div>
 
+<!-- Escalation Notifications Modal -->
+<div class="modal-overlay" id="notificationsModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">📢 升级通知记录</div>
+      <button class="modal-close" onclick="closeModal('notificationsModal')">×</button>
+    </div>
+    <div class="modal-body" style="max-height:60vh;overflow-y:auto">
+      <div id="notificationsList"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('notificationsModal')">关闭</button>
+      <button class="btn btn-primary" onclick="loadNotifications(true)">刷新</button>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
 <script>
 // ====== Configuration ======
@@ -1527,7 +1704,11 @@ let state = {
   selectedDashMetrics: new Set(['cpu.usage', 'memory.usage']),
   historyData: null,
   timeRangeMinutes: 15,
+  expandedAlerts: new Set(),
 };
+
+const SEVERITY_TEXT = { critical: '严重', warning: '警告', info: '信息' };
+function sevText(sev) { return SEVERITY_TEXT[sev] || sev || '警告'; }
 
 let lineChart = null;
 let heatmapChart = null;
@@ -1817,14 +1998,15 @@ function renderRecentAlerts(alerts) {
     <div class="alert-item">
       <div class="alert-severity ${a.severity || 'warning'}"></div>
       <div class="alert-content">
-        <div class="alert-title">${a.metric} - ${a.rule_name || a.algorithm || '异常检测'}</div>
+        <div class="alert-title">${(a.escalation_count ? '🔺 ' : '')}${a.metric} - ${a.rule_name || a.algorithm || '异常检测'}</div>
         <div class="alert-meta">
-          <span>值: ${a.value?.toFixed(2) ?? '-'}</span>
-          <span>评分: ${a.score?.toFixed(2) ?? '-'}</span>
-          <span>${formatTime(a.timestamp)}</span>
+          <span>值: ${(a.last_value ?? a.value)?.toFixed?.(2) ?? '-'}</span>
+          <span>评分: ${(a.last_score ?? a.score)?.toFixed?.(2) ?? '-'}</span>
+          ${a.repeat_count > 1 ? `<span>×${a.repeat_count}</span>` : ''}
+          <span>${formatTime(a.last_time || a.timestamp)}</span>
         </div>
       </div>
-      <span class="badge badge-${a.severity === 'critical' ? 'danger' : a.severity === 'warning' ? 'warning' : 'info'}">${a.severity || 'warning'}</span>
+      <span class="badge badge-${a.severity === 'critical' ? 'danger' : a.severity === 'warning' ? 'warning' : 'info'}">${sevText(a.severity)}</span>
     </div>
   `).join('');
 }
@@ -2099,11 +2281,16 @@ function renderAlerts() {
 
   // Update counts
   const counts = { active: 0, acknowledged: 0, resolved: 0, suppressed: 0 };
-  state.alerts.forEach(a => { if (counts[a.status] !== undefined) counts[a.status]++; });
+  let escalated = 0;
+  state.alerts.forEach(a => {
+    if (counts[a.status] !== undefined) counts[a.status]++;
+    if ((a.escalation_count || 0) > 0) escalated++;
+  });
   document.getElementById('activeAlerts').textContent = counts.active;
   document.getElementById('ackAlerts').textContent = counts.acknowledged;
   document.getElementById('resolvedAlerts').textContent = counts.resolved;
   document.getElementById('suppressedAlerts').textContent = counts.suppressed;
+  document.getElementById('escalatedAlerts').textContent = escalated;
 
   const container = document.getElementById('alertsList');
   if (!filtered.length) {
@@ -2119,19 +2306,31 @@ function renderAlerts() {
     const statusText = a.status === 'active' ? '活跃' :
                        a.status === 'acknowledged' ? '已确认' :
                        a.status === 'resolved' ? '已解决' : '已抑制';
+    const escCount = a.escalation_count || 0;
+    const isEscalated = escCount > 0;
+    const expanded = state.expandedAlerts.has(a.id);
+    const repeat = a.repeat_count || 1;
 
     return `
-      <div class="alert-item">
+      <div class="alert-item ${isEscalated ? 'escalated' : ''}">
         <div class="alert-severity ${a.severity || 'warning'}"></div>
         <div class="alert-content">
-          <div class="alert-title">${a.metric} · ${a.rule_name || a.algorithm || '异常'}</div>
-          <div class="alert-meta">
-            <span class="badge badge-${severityClass}">${a.severity || 'warning'}</span>
-            <span>值: <strong>${a.value?.toFixed(2) ?? '-'}</strong></span>
-            <span>评分: ${a.score?.toFixed(2) ?? '-'}</span>
-            <span>算法: ${a.algorithm || '-'}</span>
-            <span>${formatTime(a.timestamp)}</span>
+          <div class="alert-title">
+            ${a.metric} · ${a.rule_name || a.algorithm || '异常'}
+            ${isEscalated ? '<span class="badge badge-escalated">🔺 已升级</span>' : ''}
           </div>
+          <div class="alert-meta">
+            <span class="badge badge-${severityClass}">${sevText(a.severity)}</span>
+            <span>值: <strong>${(a.last_value ?? a.value)?.toFixed?.(2) ?? (a.last_value ?? a.value ?? '-')}</strong></span>
+            <span>评分: ${(a.last_score ?? a.score)?.toFixed?.(2) ?? '-'}</span>
+            <span>算法: ${a.algorithm || '-'}</span>
+            ${repeat > 1 ? `<span class="badge badge-purple">重复 ${repeat} 次</span>` : ''}
+            <span>${formatTime(a.last_time || a.timestamp)}</span>
+            <a class="history-btn" onclick="toggleAlertHistory('${a.id}')">
+              ${expanded ? '收起升级历史 ▲' : `升级历史 (${(a.history || []).length}) ▼`}
+            </a>
+          </div>
+          ${expanded ? `<div class="esc-history" id="escHistory-${a.id}"><div class="esc-timeline">${renderEscalationTimeline(a)}</div></div>` : ''}
         </div>
         <div class="alert-actions">
           <span class="badge ${statusBadge}">${statusText}</span>
@@ -2141,6 +2340,95 @@ function renderAlerts() {
       </div>
     `;
   }).join('');
+
+  // Lazy-load full history for expanded alerts
+  state.expandedAlerts.forEach(id => loadAlertHistory(id));
+}
+
+function renderEscalationTimeline(a) {
+  const history = a.history || [];
+  if (!history.length) return '<div style="font-size:12px;color:var(--text-muted)">暂无历史记录</div>';
+  return history.slice().reverse().map(h => {
+    const iconMap = {
+      created: { cls: '', icon: '🔔' },
+      repeat: { cls: 't-repeat', icon: '🔁' },
+      repeat_escalated: { cls: 't-escalated', icon: '🔺' },
+      timeout_escalated: { cls: 't-escalated', icon: '⏱️' },
+      timeout_notified: { cls: 't-notified', icon: '📢' },
+      acknowledged: { cls: 't-acknowledged', icon: '✅' },
+      resolved: { cls: 't-resolved', icon: '✔️' },
+    };
+    const meta = iconMap[h.type] || { cls: '', icon: '•' };
+    const sevChange = (h.from_severity || h.to_severity)
+      ? `<span class="esc-sev-change">${sevText(h.from_severity)} → ${sevText(h.to_severity)}</span>`
+      : '';
+    return `
+      <li class="${meta.cls}">
+        <span class="esc-time">${formatTime(h.timestamp)}</span>
+        ${meta.icon} <strong>${h.label || h.type}</strong>
+        ${sevChange ? ' ' + sevChange : ''}
+        ${h.detail ? `<div style="margin-top:2px;color:var(--text-muted)">${h.detail}</div>` : ''}
+      </li>`;
+  }).join('');
+}
+
+async function toggleAlertHistory(id) {
+  if (state.expandedAlerts.has(id)) {
+    state.expandedAlerts.delete(id);
+  } else {
+    state.expandedAlerts.add(id);
+  }
+  renderAlerts();
+}
+
+async function loadAlertHistory(id) {
+  const data = await api(`/api/alerts/${id}/history`);
+  if (!data) return;
+  const alert = state.alerts.find(a => a.id === id);
+  if (alert) {
+    alert.history = data.history || [];
+    alert.escalation_count = data.escalation_count;
+    alert.repeat_count = data.repeat_count;
+  }
+  const box = document.getElementById(`escHistory-${id}`);
+  if (box) {
+    box.innerHTML = `<div class="esc-timeline">${renderEscalationTimeline(
+      { history: data.history }
+    )}</div>`;
+  }
+}
+
+// ====== Escalation Notifications ======
+async function loadNotifications(showModal = false) {
+  const data = await api('/api/notifications?limit=100');
+  if (!data) return;
+  const list = data.notifications || [];
+  const box = document.getElementById('notificationsList');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">暂无升级通知</div></div>';
+  } else {
+    box.innerHTML = list.map(n => `
+      <div class="alert-item ${n.escalation_type === 'timeout' ? '' : 'escalated'}">
+        <div class="alert-severity ${n.severity || 'warning'}"></div>
+        <div class="alert-content">
+          <div class="alert-title">
+            ${n.title || '升级通知'}
+            <span class="badge ${n.escalation_type === 'timeout' ? 'badge-warning' : 'badge-danger'}">
+              ${n.escalation_type === 'timeout' ? '超时' : '重复'}
+            </span>
+            ${(n.channels || []).includes('webhook') ? '<span class="badge badge-success">webhook</span>' : ''}
+          </div>
+          <div class="alert-meta">
+            <span class="badge badge-${n.severity === 'critical' ? 'danger' : 'warning'}">${sevText(n.severity)}</span>
+            <span>${n.metric} · ${n.rule_name || '-'}</span>
+            <span>${formatTime(n.timestamp)}</span>
+          </div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">${n.message || ''}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+  if (showModal) openModal('notificationsModal');
 }
 
 async function ackAlert(id) {
@@ -2174,7 +2462,27 @@ function renderRules() {
     return;
   }
 
-  container.innerHTML = state.rules.map(r => `
+  container.innerHTML = state.rules.map(r => {
+    const esc = r.escalation || {};
+    const escEnabled = esc.enabled !== false;
+    let escSummary = '';
+    if (escEnabled) {
+      const parts = [];
+      if (esc.repeat_enabled) {
+        parts.push(`🔁 ${esc.repeat_window}s 内 ≥${esc.repeat_count} 次 → ${sevText(esc.repeat_severity)}`);
+      }
+      (esc.timeout_stages || []).forEach(st => {
+        if (st.action === 'escalate') parts.push(`⏱️ ${st.after_seconds}s 未处理 → ${sevText(st.severity)}`);
+        else parts.push(`📢 ${st.after_seconds}s 再次通知`);
+      });
+      escSummary = `
+        <div class="esc-rule-summary">
+          <span><strong>🔺 升级策略:</strong></span>
+          ${parts.length ? parts.map(p => `<span>${p}</span>`).join('') : '<span>已启用（未配置触发条件）</span>'}
+          ${esc.webhook_url ? '<span>🔗 webhook 已配置</span>' : ''}
+        </div>`;
+    }
+    return `
     <div class="rule-card">
       <div class="rule-header">
         <div class="rule-name">${r.name || r.id}</div>
@@ -2188,13 +2496,63 @@ function renderRules() {
         <div><dt>指标</dt><dd>${r.metric}</dd></div>
         <div><dt>算法</dt><dd>${r.algorithm}</dd></div>
         <div><dt>阈值</dt><dd>${r.threshold}</dd></div>
-        <div><dt>级别</dt><dd><span class="badge badge-${r.severity === 'critical' ? 'danger' : r.severity === 'warning' ? 'warning' : 'info'}">${r.severity}</span></dd></div>
+        <div><dt>级别</dt><dd><span class="badge badge-${r.severity === 'critical' ? 'danger' : r.severity === 'warning' ? 'warning' : 'info'}">${sevText(r.severity)}</span></dd></div>
         <div><dt>动态阈值</dt><dd>${r.dynamic_threshold ? '是' : '否'}</dd></div>
         <div><dt>窗口</dt><dd>${r.params?.window_size || '-'}</dd></div>
       </dl>
+      ${escSummary}
       ${r.description ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">${r.description}</div>` : ''}
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
+}
+
+function getEscalationForm() {
+  const stages = [];
+  const escTimeout = parseInt(document.getElementById('ruleEscTimeoutEsc').value) || 0;
+  if (escTimeout > 0) {
+    stages.push({
+      after_seconds: escTimeout,
+      action: 'escalate',
+      severity: document.getElementById('ruleEscTimeoutSeverity').value,
+    });
+  }
+  const escNotify = parseInt(document.getElementById('ruleEscTimeoutNotify').value) || 0;
+  if (escNotify > 0) {
+    stages.push({ after_seconds: escNotify, action: 'notify', message: '告警持续未处理，已再次通知值班人员' });
+  }
+  return {
+    enabled: document.getElementById('ruleEscEnabled').checked,
+    repeat_enabled: document.getElementById('ruleEscRepeatEnabled').checked,
+    repeat_window: parseInt(document.getElementById('ruleEscRepeatWindow').value) || 300,
+    repeat_count: parseInt(document.getElementById('ruleEscRepeatCount').value) || 3,
+    repeat_severity: document.getElementById('ruleEscRepeatSeverity').value,
+    timeout_enabled: document.getElementById('ruleEscTimeoutEnabled').checked,
+    timeout_stages: stages,
+    webhook_url: document.getElementById('ruleEscWebhook').value.trim(),
+  };
+}
+
+function fillEscalationForm(esc) {
+  esc = esc || {};
+  document.getElementById('ruleEscEnabled').checked = esc.enabled !== false;
+  document.getElementById('ruleEscRepeatEnabled').checked = esc.repeat_enabled !== false;
+  document.getElementById('ruleEscRepeatWindow').value = esc.repeat_window ?? 300;
+  document.getElementById('ruleEscRepeatCount').value = esc.repeat_count ?? 3;
+  document.getElementById('ruleEscRepeatSeverity').value = esc.repeat_severity || 'critical';
+  document.getElementById('ruleEscTimeoutEnabled').checked = esc.timeout_enabled !== false;
+  document.getElementById('ruleEscWebhook').value = esc.webhook_url || '';
+  const stages = esc.timeout_stages || [];
+  const escStage = stages.find(s => s.action === 'escalate');
+  const notifyStage = stages.find(s => s.action === 'notify');
+  document.getElementById('ruleEscTimeoutEsc').value = escStage ? escStage.after_seconds : 60;
+  document.getElementById('ruleEscTimeoutSeverity').value = escStage ? escStage.severity : 'critical';
+  document.getElementById('ruleEscTimeoutNotify').value = notifyStage ? notifyStage.after_seconds : 300;
+  toggleEscalationFields();
+}
+
+function toggleEscalationFields() {
+  const enabled = document.getElementById('ruleEscEnabled').checked;
+  document.getElementById('escFields').style.display = enabled ? '' : 'none';
 }
 
 function showAddRuleModal() {
@@ -2209,6 +2567,7 @@ function showAddRuleModal() {
   document.getElementById('ruleDynamicThreshold').checked = false;
   document.getElementById('ruleEnabled').checked = true;
   document.getElementById('ruleDescription').value = '';
+  fillEscalationForm(null);
   document.getElementById('ruleModal').dataset.editId = '';
   openModal('ruleModal');
 }
@@ -2228,6 +2587,7 @@ function editRule(id) {
   document.getElementById('ruleDynamicThreshold').checked = rule.dynamic_threshold || false;
   document.getElementById('ruleEnabled').checked = rule.enabled !== false;
   document.getElementById('ruleDescription').value = rule.description || '';
+  fillEscalationForm(rule.escalation);
   document.getElementById('ruleModal').dataset.editId = id;
   openModal('ruleModal');
 }
@@ -2248,6 +2608,7 @@ async function saveRule() {
     dynamic_threshold: document.getElementById('ruleDynamicThreshold').checked,
     enabled: document.getElementById('ruleEnabled').checked,
     description: document.getElementById('ruleDescription').value,
+    escalation: getEscalationForm(),
     params: {
       window_size: parseInt(document.getElementById('ruleWindowSize').value) || 200,
       alpha: parseFloat(document.getElementById('ruleAlpha').value) || 0.3,
